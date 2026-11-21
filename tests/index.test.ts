@@ -37,7 +37,7 @@ describe("SQLite FTS5 incremental SHA-256 index", () => {
       // Query with tricky FTS5 characters must succeed cleanly
       const hits = idx.search("ERR_CERT", { dir });
       expect(hits).toHaveLength(1);
-      expect(hits[0].filePath).toBe(realpathSync(f1));
+      expect(hits[0].filePath).toBe(realpathSync.native(f1));
       expect(hits[0].matchedWords[0].text).toBe("ERR_CERT_REVOKED");
 
       // Deleting a file prunes it on re-index

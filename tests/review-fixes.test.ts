@@ -37,7 +37,7 @@ describe("pixgrep whole-branch review regression fixes (C1-C5, I1-I9, M1-M5)", (
       // C1: searching `foo` with limit 2 MUST NOT return `foo2` siblings AND MUST find `foo/target.svg`!
       const hits = idx.search("ERR_CERT", { dir: foo, limit: 2 });
       expect(hits).toHaveLength(1);
-      expect(hits[0].filePath).toBe(realpathSync(join(foo, "target.svg")));
+      expect(hits[0].filePath).toBe(realpathSync.native(join(foo, "target.svg")));
 
       // I8: searching "svg" must NOT match every .svg via file_path
       const extHits = idx.search("svg", { dir: foo });
