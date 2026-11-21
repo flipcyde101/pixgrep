@@ -6,6 +6,10 @@
 [![Node >=24](https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen.svg)](https://nodejs.org)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-informational.svg)](#architecture)
 
+[![Watch the 15-second pixgrep demo](https://github.com/flipcyde101/pixgrep/releases/download/v0.1.0/pixgrep-poster.png)](https://github.com/flipcyde101/pixgrep/releases/download/v0.1.0/pixgrep-demo.mp4)
+
+[Watch the 15-second pixgrep demo (MP4)](https://github.com/flipcyde101/pixgrep/releases/download/v0.1.0/pixgrep-demo.mp4)
+
 ---
 
 ## Try It in 2 Seconds (Zero Setup)
