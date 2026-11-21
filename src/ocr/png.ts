@@ -1,8 +1,8 @@
 import { deflateSync, inflateSync } from "node:zlib";
 
-const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+export const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const MAX_DIMENSION = 4096;
-const MAX_DECODED_BYTES = 64 * 1024 * 1024;
+const MAX_DECODED_BYTES = MAX_DIMENSION * (1 + MAX_DIMENSION * 4);
 
 export interface DecodedPng {
   width: number;
@@ -22,7 +22,7 @@ const CRC_TABLE = (() => {
   return t;
 })();
 
-function crc32(buf: Buffer): number {
+export function crc32(buf: Buffer): number {
   let c = 0xffffffff;
   for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
@@ -40,7 +40,8 @@ function paethPredictor(a: number, b: number, c: number): number {
 
 /**
  * Pure-TS zero-dependency PNG decoder supporting 8-bit non-interlaced Grayscale (0),
- * Truecolor RGB (2), Grayscale+Alpha (4), and RGBA (6), plus `tEXt` metadata extraction.
+ * Truecolor RGB (2), Grayscale+Alpha (4), and RGBA (6), with CRC-32 chunk integrity
+ * verification, strict decompression bounds, and `tEXt` metadata extraction.
  */
 export function decodePng(buf: Buffer): DecodedPng {
   if (buf.length < 33 || !buf.subarray(0, 8).equals(PNG_SIG)) {
@@ -52,29 +53,57 @@ export function decodePng(buf: Buffer): DecodedPng {
   let height = 0;
   let bitDepth = 0;
   let colorType = 0;
+  let compression = 0;
+  let filterMethod = 0;
   let interlace = 0;
+  let seenIhdr = false;
+  let seenIend = false;
   const idatChunks: Buffer[] = [];
-  const textChunks: Record<string, string> = {};
+  const textChunks: Record<string, string> = Object.create(null) as Record<string, string>;
 
-  while (offset + 12 <= buf.length) {
+  while (offset < buf.length) {
+    if (offset + 12 > buf.length) {
+      throw new Error("Truncated PNG chunk header");
+    }
     const length = buf.readUInt32BE(offset);
-    const type = buf.subarray(offset + 4, offset + 8).toString("ascii");
+    if (length > 0x7fffffff || offset + 12 + length > buf.length) {
+      throw new Error("Truncated PNG chunk payload");
+    }
+    const typeBuf = buf.subarray(offset + 4, offset + 8);
+    const type = typeBuf.toString("ascii");
     const dataStart = offset + 8;
     const dataEnd = dataStart + length;
-    if (dataEnd + 4 > buf.length) break;
     const data = buf.subarray(dataStart, dataEnd);
+    const expectedCrc = buf.readUInt32BE(dataEnd);
+    const actualCrc = crc32(buf.subarray(offset + 4, dataEnd));
+    if (actualCrc !== expectedCrc) {
+      throw new Error(`PNG CRC-32 mismatch in ${type} chunk`);
+    }
     offset = dataEnd + 4;
 
-    if (type === "IHDR") {
-      if (length < 13) throw new Error("Invalid PNG IHDR chunk");
+    if (!seenIhdr) {
+      if (type !== "IHDR" || length !== 13) {
+        throw new Error("PNG must begin with a valid 13-byte IHDR chunk");
+      }
+      seenIhdr = true;
       width = data.readUInt32BE(0);
       height = data.readUInt32BE(4);
       bitDepth = data[8];
       colorType = data[9];
+      compression = data[10];
+      filterMethod = data[11];
       interlace = data[12];
       if (width <= 0 || height <= 0 || width > MAX_DIMENSION || height > MAX_DIMENSION) {
         throw new Error(`Unsupported PNG dimensions ${width}x${height}`);
       }
+      if (compression !== 0 || filterMethod !== 0) {
+        throw new Error(`Unsupported PNG compression=${compression} filterMethod=${filterMethod}`);
+      }
+      continue;
+    }
+
+    if (type === "IHDR") {
+      throw new Error("Duplicate PNG IHDR chunk");
     } else if (type === "IDAT") {
       idatChunks.push(data);
     } else if (type === "tEXt") {
@@ -85,11 +114,14 @@ export function decodePng(buf: Buffer): DecodedPng {
         textChunks[key] = val;
       }
     } else if (type === "IEND") {
+      seenIend = true;
       break;
     }
   }
 
-  if (width === 0 || height === 0) throw new Error("Missing PNG IHDR chunk");
+  if (!seenIhdr || !seenIend || idatChunks.length === 0) {
+    throw new Error("Incomplete PNG file (missing IHDR, IDAT, or IEND)");
+  }
   if (bitDepth !== 8 || interlace !== 0) {
     throw new Error(`Unsupported PNG format (bitDepth=${bitDepth}, interlace=${interlace})`);
   }
@@ -107,7 +139,7 @@ export function decodePng(buf: Buffer): DecodedPng {
     throw new Error("PNG image exceeds maximum decoded buffer size");
   }
 
-  const raw = inflateSync(Buffer.concat(idatChunks), { maxOutputLength: MAX_DECODED_BYTES });
+  const raw = inflateSync(Buffer.concat(idatChunks), { maxOutputLength: expectedRawLen });
   if (raw.length < expectedRawLen) {
     throw new Error("Truncated PNG IDAT stream");
   }
@@ -115,6 +147,9 @@ export function decodePng(buf: Buffer): DecodedPng {
   const recon = new Uint8Array(height * stride);
   for (let y = 0; y < height; y++) {
     const filter = raw[y * (stride + 1)];
+    if (filter > 4) {
+      throw new Error(`Invalid PNG scanline filter type ${filter}`);
+    }
     const rowIn = y * (stride + 1) + 1;
     const rowOut = y * stride;
     const prevOut = (y - 1) * stride;
@@ -170,16 +205,18 @@ export function readPngTextChunks(buf: Buffer): { width: number; height: number;
   let offset = 8;
   let width = 0;
   let height = 0;
-  const textChunks: Record<string, string> = {};
+  const textChunks: Record<string, string> = Object.create(null) as Record<string, string>;
   while (offset + 12 <= buf.length) {
     const length = buf.readUInt32BE(offset);
+    if (length > 0x7fffffff || offset + 12 + length > buf.length) return null;
     const type = buf.subarray(offset + 4, offset + 8).toString("ascii");
     const dataStart = offset + 8;
     const dataEnd = dataStart + length;
-    if (dataEnd + 4 > buf.length) break;
     const data = buf.subarray(dataStart, dataEnd);
+    const expectedCrc = buf.readUInt32BE(dataEnd);
+    if (crc32(buf.subarray(offset + 4, dataEnd)) !== expectedCrc) return null;
     offset = dataEnd + 4;
-    if (type === "IHDR" && length >= 8) {
+    if (type === "IHDR" && length === 13) {
       width = data.readUInt32BE(0);
       height = data.readUInt32BE(4);
     } else if (type === "tEXt") {
@@ -215,8 +252,8 @@ export function encodeRgbPng(
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // RGB
+  ihdr[8] = 8;
+  ihdr[9] = 2;
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
@@ -224,7 +261,7 @@ export function encodeRgbPng(
   const stride = width * 3;
   const raw = Buffer.alloc(height * (1 + stride));
   for (let y = 0; y < height; y++) {
-    raw[y * (1 + stride)] = 0; // filter None
+    raw[y * (1 + stride)] = 0;
     raw.set(rgb.subarray(y * stride, (y + 1) * stride), y * (1 + stride) + 1);
   }
   const compressed = deflateSync(raw);

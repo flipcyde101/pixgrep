@@ -1,14 +1,21 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { resolve } from "node:path";
 import type { OcrBackendName, OcrResult, OcrWord } from "../types.js";
 import { readPngTextChunks } from "./png.js";
 
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_SIDECAR_BYTES = 4 * 1024 * 1024;
+
 const WINRT_OCR_SCRIPT = `
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 [void][Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
 [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
 [void][Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+[void][Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
 $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' })[0]
 function Await-WinRT($op, $resultType) {
   $task = $asTaskGeneric.MakeGenericMethod($resultType).Invoke($null, @($op))
@@ -22,11 +29,12 @@ $decoder = Await-WinRT ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($s
 $bitmap = Await-WinRT ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 if (-not $engine) { $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('en-US')) }
+if (-not $engine) { throw 'No Windows WinRT OCR language pack available' }
 $ocr = Await-WinRT ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
 $words = @()
 foreach ($line in $ocr.Lines) {
   foreach ($w in $line.Words) {
-    $words += @{ text = $w.Text; x = [math]::Round($w.BoundingRect.X); y = [math]::Round($w.BoundingRect.Y); w = [math]::Round($w.BoundingRect.Width); h = [math]::Round($w.BoundingRect.Height) }
+    $words += @{ text = $w.Text; x = [math]::Max(0, [int][math]::Round($w.BoundingRect.X)); y = [math]::Max(0, [int][math]::Round($w.BoundingRect.Y)); w = [math]::Max(1, [int][math]::Round($w.BoundingRect.Width)); h = [math]::Max(1, [int][math]::Round($w.BoundingRect.Height)) }
   }
 }
 $out = @{ width = $bitmap.PixelWidth; height = $bitmap.PixelHeight; fullText = $ocr.Text; words = $words }
@@ -38,8 +46,7 @@ import Foundation
 import Vision
 import AppKit
 
-guard CommandLine.arguments.count >= 2 else { exit(1) }
-let path = CommandLine.arguments[1]
+guard let path = ProcessInfo.processInfo.environment["PIXGREP_IMAGE_PATH"], !path.isEmpty else { exit(1) }
 guard let img = NSImage(contentsOfFile: path),
       let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { exit(2) }
 let width = cg.width
@@ -52,26 +59,143 @@ var words: [[String: Any]] = []
 var lines: [String] = []
 for obs in req.results ?? [] {
   guard let cand = obs.topCandidates(1).first else { continue }
-  lines.append(cand.string)
-  let box = obs.boundingBox
-  let x = Int(box.origin.x * Double(width))
-  let y = Int((1.0 - box.origin.y - box.size.height) * Double(height))
-  let w = max(1, Int(box.size.width * Double(width)))
-  let h = max(1, Int(box.size.height * Double(height)))
-  words.append(["text": cand.string, "x": x, "y": y, "w": w, "h": h])
+  let lineText = cand.string
+  lines.append(lineText)
+  var idx = lineText.startIndex
+  while idx < lineText.endIndex {
+    while idx < lineText.endIndex && lineText[idx].isWhitespace { idx = lineText.index(after: idx) }
+    let start = idx
+    while idx < lineText.endIndex && !lineText[idx].isWhitespace { idx = lineText.index(after: idx) }
+    if start < idx {
+      let token = String(lineText[start..<idx])
+      let rectObs = try? cand.boundingBox(for: start..<idx)
+      let box = rectObs?.boundingBox ?? obs.boundingBox
+      let x = max(0, Int(box.origin.x * Double(width)))
+      let y = max(0, Int((1.0 - box.origin.y - box.size.height) * Double(height)))
+      let w = max(1, Int(box.size.width * Double(width)))
+      let h = max(1, Int(box.size.height * Double(height)))
+      words.append(["text": token, "x": x, "y": y, "w": w, "h": h])
+    }
+  }
 }
 let payload: [String: Any] = ["width": width, "height": height, "fullText": lines.joined(separator: "\\n"), "words": words]
 let data = try JSONSerialization.data(withJSONObject: payload, options: [])
 FileHandle.standardOutput.write(data)
 `;
 
+function sanitizeWords(raw: unknown): OcrWord[] {
+  if (!Array.isArray(raw)) return [];
+  const out: OcrWord[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    if (typeof rec.text !== "string" || !rec.text.trim()) continue;
+    const x = Number(rec.x);
+    const y = Number(rec.y);
+    const w = Number(rec.w);
+    const h = Number(rec.h);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) continue;
+    out.push({
+      text: rec.text.trim(),
+      x: Math.max(0, Math.round(x)),
+      y: Math.max(0, Math.round(y)),
+      w: Math.max(1, Math.round(w)),
+      h: Math.max(1, Math.round(h)),
+      confidence: typeof rec.confidence === "number" && Number.isFinite(rec.confidence) ? rec.confidence : undefined,
+    });
+  }
+  return out;
+}
+
+function decodeXmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_m, n) => {
+      const code = Number(n);
+      return Number.isInteger(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "";
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isInteger(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "";
+    });
+}
+
+function parseSvgDimensions(svg: string): { width: number; height: number } {
+  const openTagEnd = svg.indexOf(">", svg.toLowerCase().indexOf("<svg"));
+  const header = openTagEnd !== -1 ? svg.slice(0, openTagEnd + 1) : svg.slice(0, 512);
+  const wMatch = /\bwidth=["'](\d+(?:\.\d+)?)/i.exec(header);
+  const hMatch = /\bheight=["'](\d+(?:\.\d+)?)/i.exec(header);
+  if (wMatch && hMatch) {
+    return { width: Math.round(Number(wMatch[1])), height: Math.round(Number(hMatch[1])) };
+  }
+  const vbMatch = /\bviewBox=["']\s*-?\d+(?:\.\d+)?[\s,]+-?\d+(?:\.\d+)?[\s,]+(\d+(?:\.\d+)?)[\s,]+(\d+(?:\.\d+)?)\s*["']/i.exec(header);
+  if (vbMatch) {
+    return { width: Math.round(Number(vbMatch[1])), height: Math.round(Number(vbMatch[2])) };
+  }
+  return { width: 1280, height: 720 };
+}
+
+/**
+ * Linear-time SVG `<text>...</text>` scanner (immune to quadratic ReDoS on unclosed tags).
+ */
+function extractSvgTextWords(svg: string): OcrWord[] {
+  const words: OcrWord[] = [];
+  const lower = svg.toLowerCase();
+  let pos = 0;
+
+  while (pos < svg.length) {
+    const start = lower.indexOf("<text", pos);
+    if (start === -1) break;
+    const afterTag = lower[start + 5] ?? "";
+    if (afterTag !== ">" && afterTag !== " " && afterTag !== "\t" && afterTag !== "\n" && afterTag !== "\r" && afterTag !== "/") {
+      pos = start + 5;
+      continue;
+    }
+    const openEnd = svg.indexOf(">", start + 5);
+    if (openEnd === -1) break;
+    if (svg[openEnd - 1] === "/") {
+      pos = openEnd + 1;
+      continue;
+    }
+    const closeStart = lower.indexOf("</text>", openEnd + 1);
+    if (closeStart === -1) break;
+
+    const attrs = svg.slice(start + 5, openEnd);
+    const inner = svg.slice(openEnd + 1, closeStart);
+    pos = closeStart + 7;
+
+    const plain = decodeXmlEntities(inner.replace(/<[^>]+>/g, " "))
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!plain) continue;
+
+    const xm = /\bx=["'](\d+(?:\.\d+)?)/i.exec(attrs);
+    const ym = /\by=["'](\d+(?:\.\d+)?)/i.exec(attrs);
+    const baseX = xm ? Math.round(Number(xm[1])) : 20;
+    const baseY = ym ? Math.round(Number(ym[1])) : 20;
+    let offsetX = baseX;
+    for (const tok of plain.split(/\s+/)) {
+      const estW = Math.max(12, tok.length * 10);
+      words.push({ text: tok, x: offsetX, y: Math.max(0, baseY - 16), w: estW, h: 20 });
+      offsetX += estW + 8;
+    }
+  }
+
+  return words;
+}
+
 export function parseTesseractTsv(tsv: string): { width: number; height: number; fullText: string; words: OcrWord[] } {
   const words: OcrWord[] = [];
   let width = 0;
   let height = 0;
-  for (const rawLine of tsv.split(/\r?\n/).slice(1)) {
+  for (const rawLine of tsv.split(/\r?\n/)) {
+    if (!rawLine.trim()) continue;
     const cols = rawLine.split("\t");
-    if (cols.length < 12) continue;
+    if (cols.length < 12 || cols[0] === "level") continue;
     const level = Number(cols[0]);
     const left = Number(cols[6]);
     const top = Number(cols[7]);
@@ -79,11 +203,21 @@ export function parseTesseractTsv(tsv: string): { width: number; height: number;
     const h = Number(cols[9]);
     const conf = Number(cols[10]);
     const text = cols.slice(11).join("\t").trim();
+    if (!Number.isFinite(level) || !Number.isFinite(left) || !Number.isFinite(top) || !Number.isFinite(w) || !Number.isFinite(h)) {
+      continue;
+    }
     if (level === 1 && w > 0 && h > 0) {
-      width = w;
-      height = h;
+      width = Math.round(w);
+      height = Math.round(h);
     } else if (level === 5 && text) {
-      words.push({ text, x: left, y: top, w, h, confidence: Number.isFinite(conf) ? conf : undefined });
+      words.push({
+        text,
+        x: Math.max(0, Math.round(left)),
+        y: Math.max(0, Math.round(top)),
+        w: Math.max(1, Math.round(w)),
+        h: Math.max(1, Math.round(h)),
+        confidence: Number.isFinite(conf) ? conf : undefined,
+      });
     }
   }
   return {
@@ -95,57 +229,47 @@ export function parseTesseractTsv(tsv: string): { width: number; height: number;
 }
 
 export function extractBuiltinOcr(filePath: string): OcrResult | null {
-  // 1. Optional JSON sidecar `<image>.ocr.json`
   const sidecarPath = `${filePath}.ocr.json`;
   if (existsSync(sidecarPath)) {
     try {
-      const parsed = JSON.parse(readFileSync(sidecarPath, "utf8")) as {
-        width?: number;
-        height?: number;
-        fullText?: string;
-        words?: OcrWord[];
-      };
-      const words = Array.isArray(parsed.words) ? parsed.words : [];
-      return {
-        backend: "builtin",
-        width: parsed.width ?? 0,
-        height: parsed.height ?? 0,
-        fullText: parsed.fullText ?? words.map((w) => w.text).join(" "),
-        words,
-      };
+      if (statSync(sidecarPath).size <= MAX_SIDECAR_BYTES) {
+        const parsed = JSON.parse(readFileSync(sidecarPath, "utf8")) as {
+          width?: number;
+          height?: number;
+          fullText?: string;
+          words?: unknown;
+        };
+        const words = sanitizeWords(parsed.words);
+        return {
+          backend: "builtin",
+          width: typeof parsed.width === "number" && Number.isFinite(parsed.width) ? parsed.width : 0,
+          height: typeof parsed.height === "number" && Number.isFinite(parsed.height) ? parsed.height : 0,
+          fullText: typeof parsed.fullText === "string" ? parsed.fullText : words.map((w) => w.text).join(" "),
+          words,
+        };
+      }
     } catch {
       // fall through
     }
   }
 
   const lower = filePath.toLowerCase();
+  if (!lower.endsWith(".svg") && !lower.endsWith(".png")) {
+    return null;
+  }
+
+  try {
+    if (statSync(filePath).size > MAX_IMAGE_BYTES) return null;
+  } catch {
+    return null;
+  }
+
   const buf = readFileSync(filePath);
 
-  // 2. SVG `<text x="..." y="...">` extraction with real coordinates
   if (lower.endsWith(".svg")) {
     const svg = buf.toString("utf8");
-    const wMatch = /\bwidth=["'](\d+(?:\.\d+)?)/i.exec(svg);
-    const hMatch = /\bheight=["'](\d+(?:\.\d+)?)/i.exec(svg);
-    const width = wMatch ? Math.round(Number(wMatch[1])) : 1280;
-    const height = hMatch ? Math.round(Number(hMatch[1])) : 720;
-    const words: OcrWord[] = [];
-    const textRe = /<text\b([^>]*)>([\s\S]*?)<\/text>/gi;
-    let m: RegExpExecArray | null;
-    while ((m = textRe.exec(svg)) !== null) {
-      const attrs = m[1];
-      const rawText = m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-      if (!rawText) continue;
-      const xm = /\bx=["'](\d+(?:\.\d+)?)/i.exec(attrs);
-      const ym = /\by=["'](\d+(?:\.\d+)?)/i.exec(attrs);
-      const baseX = xm ? Math.round(Number(xm[1])) : 20;
-      const baseY = ym ? Math.round(Number(ym[1])) : 20;
-      let offsetX = baseX;
-      for (const tok of rawText.split(/\s+/)) {
-        const estW = Math.max(12, tok.length * 10);
-        words.push({ text: tok, x: offsetX, y: Math.max(0, baseY - 16), w: estW, h: 20 });
-        offsetX += estW + 8;
-      }
-    }
+    const { width, height } = parseSvgDimensions(svg);
+    const words = extractSvgTextWords(svg);
     return {
       backend: "builtin",
       width,
@@ -155,19 +279,18 @@ export function extractBuiltinOcr(filePath: string): OcrResult | null {
     };
   }
 
-  // 3. PNG embedded `tEXt` chunk (`pixgrep_ocr` JSON or `Comment`/`Description` text)
   if (lower.endsWith(".png")) {
     const meta = readPngTextChunks(buf);
     if (meta) {
       if (meta.textChunks["pixgrep_ocr"]) {
         try {
-          const parsed = JSON.parse(meta.textChunks["pixgrep_ocr"]) as { words?: OcrWord[]; fullText?: string };
-          const words = Array.isArray(parsed.words) ? parsed.words : [];
+          const parsed = JSON.parse(meta.textChunks["pixgrep_ocr"]) as { words?: unknown; fullText?: string };
+          const words = sanitizeWords(parsed.words);
           return {
             backend: "builtin",
             width: meta.width,
             height: meta.height,
-            fullText: parsed.fullText ?? words.map((w) => w.text).join(" "),
+            fullText: typeof parsed.fullText === "string" ? parsed.fullText : words.map((w) => w.text).join(" "),
             words,
           };
         } catch {
@@ -195,50 +318,59 @@ export function extractBuiltinOcr(filePath: string): OcrResult | null {
 }
 
 export function runWinRtOcr(filePath: string): OcrResult {
+  const absPath = resolve(filePath);
   const stdout = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", WINRT_OCR_SCRIPT], {
-    env: { ...process.env, PIXGREP_IMAGE_PATH: filePath },
+    env: { ...process.env, PIXGREP_IMAGE_PATH: absPath },
     encoding: "utf8",
     timeout: 20_000,
     maxBuffer: 8 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
   }).trim();
-  const parsed = JSON.parse(stdout || "{}") as {
+  if (!stdout) throw new Error("WinRT OCR returned empty output");
+  const parsed = JSON.parse(stdout) as {
     width?: number;
     height?: number;
     fullText?: string;
-    words?: OcrWord[];
+    words?: unknown;
   };
   return {
     backend: "winrt",
-    width: parsed.width ?? 0,
-    height: parsed.height ?? 0,
-    fullText: parsed.fullText ?? "",
-    words: Array.isArray(parsed.words) ? parsed.words : [],
+    width: typeof parsed.width === "number" ? parsed.width : 0,
+    height: typeof parsed.height === "number" ? parsed.height : 0,
+    fullText: typeof parsed.fullText === "string" ? parsed.fullText : "",
+    words: sanitizeWords(parsed.words),
   };
 }
 
 export function runMacVisionOcr(filePath: string): OcrResult {
-  const stdout = execFileSync("swift", ["-e", MACOS_VISION_SWIFT, filePath], {
+  const absPath = resolve(filePath);
+  const stdout = execFileSync("swift", ["-"], {
+    input: MACOS_VISION_SWIFT,
+    env: { ...process.env, PIXGREP_IMAGE_PATH: absPath },
     encoding: "utf8",
     timeout: 25_000,
     maxBuffer: 8 * 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"],
   }).trim();
-  const parsed = JSON.parse(stdout || "{}") as {
+  if (!stdout) throw new Error("macOS Vision OCR returned empty output");
+  const parsed = JSON.parse(stdout) as {
     width?: number;
     height?: number;
     fullText?: string;
-    words?: OcrWord[];
+    words?: unknown;
   };
   return {
     backend: "vision",
-    width: parsed.width ?? 0,
-    height: parsed.height ?? 0,
-    fullText: parsed.fullText ?? "",
-    words: Array.isArray(parsed.words) ? parsed.words : [],
+    width: typeof parsed.width === "number" ? parsed.width : 0,
+    height: typeof parsed.height === "number" ? parsed.height : 0,
+    fullText: typeof parsed.fullText === "string" ? parsed.fullText : "",
+    words: sanitizeWords(parsed.words),
   };
 }
 
 export function runTesseractOcr(filePath: string): OcrResult {
-  const stdout = execFileSync("tesseract", [filePath, "stdout", "tsv"], {
+  const absPath = resolve(filePath);
+  const stdout = execFileSync("tesseract", [absPath, "stdout", "tsv"], {
     encoding: "utf8",
     timeout: 25_000,
     maxBuffer: 8 * 1024 * 1024,
@@ -267,7 +399,6 @@ export function extractTextFromImage(filePath: string, backend: OcrBackendName =
   if (backend === "vision") return runMacVisionOcr(filePath);
   if (backend === "tesseract") return runTesseractOcr(filePath);
 
-  // auto mode: fast builtin metadata/SVG path first, then native OS OCR, then tesseract
   const builtin = extractBuiltinOcr(filePath);
   if (builtin && builtin.fullText.trim().length > 0) return builtin;
 

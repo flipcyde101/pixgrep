@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,14 +33,20 @@ Options:
   --backend <auto|winrt|vision|tesseract|builtin>  OCR backend (default: auto)
   --db <path>                           SQLite FTS5 index path (default: ~/.pixgrep/index.db)
   --limit <n>                           Max search results (default: 20)
-  --json                                Output machine-readable JSON
+  --json                                Output machine-readable JSON (suppresses ANSI preview)
+  --                                    End of options (allows queries starting with "-")
   -h, --help                            Show this help`);
 }
 
-function requireVal(argv: string[], i: number, flag: string): string {
+function requireVal(argv: string[], i: number, flag: string, allowNegative = false): string {
   const v = argv[i + 1];
-  if (!v || v.trim().startsWith("-")) throw new Error(`Missing value for ${flag}`);
-  return v;
+  if (v === undefined || !v.trim()) {
+    throw new Error(`Missing or empty value for ${flag}`);
+  }
+  if (!allowNegative && v.trim().startsWith("-")) {
+    throw new Error(`Missing value for ${flag}`);
+  }
+  return v.trim();
 }
 
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
@@ -56,9 +62,18 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   };
 
   const positionals: string[] = [];
+  let endOfFlags = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (endOfFlags) {
+      positionals.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      endOfFlags = true;
+      continue;
+    }
     if (arg === "-h" || arg === "--help") {
       parsed.mode = "help";
       return parsed;
@@ -70,22 +85,24 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     } else if (arg === "--json") {
       parsed.json = true;
     } else if (arg === "--protocol") {
-      const p = requireVal(argv, i, "--protocol").trim();
+      const p = requireVal(argv, i, "--protocol");
       if (p !== "halfblock" && p !== "kitty") throw new Error('--protocol must be "halfblock" or "kitty"');
       parsed.protocol = p;
       i++;
     } else if (arg === "--backend") {
-      const b = requireVal(argv, i, "--backend").trim();
+      const b = requireVal(argv, i, "--backend");
       if (!["auto", "winrt", "vision", "tesseract", "builtin"].includes(b)) {
         throw new Error("--backend must be one of auto, winrt, vision, tesseract, builtin");
       }
       parsed.backend = b as OcrBackendName;
       i++;
     } else if (arg === "--db") {
-      parsed.dbPath = requireVal(argv, i, "--db").trim();
+      parsed.dbPath = requireVal(argv, i, "--db");
       i++;
     } else if (arg === "--limit") {
-      const n = Number(requireVal(argv, i, "--limit"));
+      const raw = requireVal(argv, i, "--limit", true);
+      if (!/^-?\d+$/.test(raw)) throw new Error("--limit must be an integer 1..200");
+      const n = Number(raw);
       if (!Number.isInteger(n) || n < 1 || n > 200) throw new Error("--limit must be an integer 1..200");
       parsed.limit = n;
       i++;
@@ -97,14 +114,24 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   }
 
   if (parsed.mode === "demo") {
+    if (positionals.length > 1) {
+      throw new Error(`Unexpected extra argument "${positionals[1]}" for --demo`);
+    }
     if (positionals[0]) parsed.query = positionals[0];
     return parsed;
   }
 
   if (positionals[0] === "index") {
+    if (positionals.length > 2) {
+      throw new Error(`Unexpected extra argument "${positionals[2]}". Usage: pixgrep index <dir>`);
+    }
     parsed.mode = "index";
     parsed.dir = positionals[1] ? resolve(positionals[1]) : process.cwd();
     return parsed;
+  }
+
+  if (positionals.length > 2) {
+    throw new Error(`Unexpected extra argument "${positionals[2]}". Quote multi-word queries: pixgrep "tls error" <dir>`);
   }
 
   if (positionals.length > 0) {
@@ -114,6 +141,18 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
   }
 
   return parsed;
+}
+
+function assertExistingDirectory(dir: string): void {
+  let st;
+  try {
+    st = statSync(dir);
+  } catch {
+    throw new Error(`Directory not found: "${dir}"`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`Path is not a directory: "${dir}"`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -147,6 +186,8 @@ async function main(): Promise<void> {
     }
     return;
   }
+
+  assertExistingDirectory(args.dir);
 
   const index = new PixgrepIndex(args.dbPath);
   try {
