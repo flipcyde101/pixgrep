@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PixgrepIndex, sanitizeFts5Query } from "../src/db/index.js";
@@ -37,7 +37,7 @@ describe("SQLite FTS5 incremental SHA-256 index", () => {
       // Query with tricky FTS5 characters must succeed cleanly
       const hits = idx.search("ERR_CERT", { dir });
       expect(hits).toHaveLength(1);
-      expect(hits[0].filePath).toBe(f1);
+      expect(hits[0].filePath).toBe(realpathSync(f1));
       expect(hits[0].matchedWords[0].text).toBe("ERR_CERT_REVOKED");
 
       // Deleting a file prunes it on re-index
